@@ -1,0 +1,5 @@
+O algoritmo proposto pelo grupo busca equilibrar o número de saltos e a latência observada na rede. Enquanto o RIP considera apenas saltos e o OSPF utiliza custos configurados dos enlaces, nosso algoritmo calcula um custo híbrido utilizando a expressão:
+
+Custo = (Saltos × 10) + Latência
+
+A rota escolhida é sempre a de menor custo total.
