@@ -13,6 +13,12 @@ if [ ! -d "configs/$PROTO" ]; then
   exit 1
 fi
 
+if [ "$PROTO" = "algoritmo_proprio" ]; then
+  echo "Calculando rotas com o algoritmo proprio..."
+  python3 "configs/algoritmo_proprio/algoritmo_proprio.py"
+  echo ""
+fi
+
 for R in R1 R2 R3 R4 R5; do
   echo "===== $R : aplicando $PROTO ====="
   docker cp "configs/$PROTO/$R/daemons" "$R:/etc/frr/daemons"
