@@ -34,11 +34,15 @@ aplicar.bat rip
 ```cmd
 aplicar.bat ospf
 ```
+```cmd
+aplicar.bat algoritmo_proprio
+```
 Mac / Linux:
 ```bash
 chmod +x aplicar.sh
 ./aplicar.sh rip
-./aplicar.sh ospf 
+./aplicar.sh ospf
+./aplicar.sh algoritmo_proprio 
 ```
 Trocar de protocolo é só rodar o script de novo com o outro parâmetro, pois ele sobrescreve a configuração anterior em todos os roteadores.
 ## Verificar o funcionamento
