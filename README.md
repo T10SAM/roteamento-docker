@@ -114,3 +114,6 @@ docker exec R1 tc qdisc replace dev eth1 root netem delay 100ms
 - `docker exec R1 service frr status` - Confere se os daemons do FRR estão rodando
 - `docker exec R1 ps aux` - Lista os processos ativos dentro do roteador
 - `docker exec R4 iperf3 -s` - Executa o servidor da ferramenta iperf3
+
+## Video
+https://drive.google.com/file/d/1Pp_M9WF3Loaa1JdaGO4hfLazKJjrbP3R/view?usp=drivesdk
