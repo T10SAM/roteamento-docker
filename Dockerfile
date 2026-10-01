@@ -4,6 +4,8 @@ RUN apt-get update && \
     apt-get install -y \
     python3 \
     frr \
+    iperf3 \
+    tcpdump \
     iproute2 \
     iputils-ping \
     traceroute \
