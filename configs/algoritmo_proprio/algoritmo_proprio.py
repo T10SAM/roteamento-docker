@@ -1,217 +1,233 @@
 #!/usr/bin/env python3
-"""
-Algoritmo Proprio de Roteamento
-Metrica hibrida: custo = (saltos x 10) + latencia
-
-Para cada enlace e atribuida uma latencia em ms.
-O custo de um enlace e: 10 + latencia_do_enlace
-Ao acumular ao longo de um caminho:
-  custo_total = sum(10 + lat_i) = (n_saltos x 10) + latencia_total
-
-O algoritmo de Dijkstra encontra o menor custo para cada par de roteadores
-e gera rotas estaticas no FRR.
-"""
 
 import heapq
+import ipaddress
+import json
 import os
+import subprocess
+import time
+from threading import Lock
 
-# Topologia: (roteador_a, roteador_b, latencia_ms, rede, ip_a, ip_b)
-# As latencias foram escolhidas para que o algoritmo proprio produza
-# caminhos diferentes dos do RIP (apenas saltos) e do OSPF (custo fixo).
-ENLACES = [
-    ('R1', 'R2', 10, '192.168.5.0/29', '192.168.5.2', '192.168.5.3'),
-    ('R2', 'R3',  8, '192.168.6.0/29', '192.168.6.2', '192.168.6.3'),
-    ('R3', 'R4',  2, '192.168.7.0/29', '192.168.7.2', '192.168.7.3'),
-    ('R4', 'R5',  2, '192.168.8.0/29', '192.168.8.2', '192.168.8.3'),
-    ('R5', 'R1',  9, '192.168.9.0/29', '192.168.9.3', '192.168.9.2'),
-    ('R1', 'R3',  3, '192.100.1.0/29', '192.100.1.2', '192.100.1.3'),
-    ('R5', 'R2',  3, '192.100.2.0/29', '192.100.2.2', '192.100.2.3'),
-]
+PESO_SALTO = 10 
+INTERVALO = 10 # Intervalo de tempo em que o agente mede a latencia
+TIMEOUT_VIZINHO = 30 # Se nao chega HELLO de um vizinho por esse tempo, ele é considerado fora do ar
+TIMEOUT_LSA = 60
 
-ROTEADORES = ['R1', 'R2', 'R3', 'R4', 'R5']
+NOME = os.environ.get("ROUTER_NOME", None)  # main.py resolve o fallback p/ hostname
+
+# Pergunta ao proprio sistema operacional (ip addr) quais interfaces de rede este container tem e qual IP/sub-rede cada uma usa.
+def obter_interfaces():
+    saida = subprocess.run(["ip", "-4", "-j", "addr", "show"],
+                            capture_output=True, text=True)
+    dados = json.loads(saida.stdout)
+    interfaces = []
+    for item in dados:
+        if item["ifname"] == "lo":
+            continue # ignora a interface de loopback (127.0.0.1)
+        for addr in item.get("addr_info", []):
+             # Monta o objeto de rede a partir do IP e da mascara
+            rede = ipaddress.ip_interface(f'{addr["local"]}/{addr["prefixlen"]}')
+            interfaces.append({
+                "iface": item["ifname"], "ip": addr["local"],
+                "rede": str(rede.network), "broadcast": str(rede.network.broadcast_address),
+            })
+    return interfaces
+
+# Mede a latencia (em milissegundos) ate um IP vizinho usando comando ping
+def medir_latencia(ip, tentativas=3):
+    try:
+        saida = subprocess.run(
+            ["ping", "-c", str(tentativas), "-W", "1", ip],
+            capture_output=True, text=True, timeout=5
+        )
+        for linha in saida.stdout.splitlines():
+            if "rtt" in linha or "round-trip" in linha:
+                return float(linha.split("=")[1].strip().split("/")[1])
+    except Exception:
+        pass
+    return None # Retorna None se o vizinho nao responder
 
 
-def construir_grafo():
-    grafo = {r: [] for r in ROTEADORES}
-    for ra, rb, lat, rede, ipa, ipb in ENLACES:
-        custo = 10 + lat
-        grafo[ra].append((rb, custo, ipb))
-        grafo[rb].append((ra, custo, ipa))
-    return grafo
-
-
-def dijkstra(grafo, origem):
-    dist = {r: float('inf') for r in ROTEADORES}
+def dijkstra(grafo, origem, roteadores):
+    dist = {r: float('inf') for r in roteadores} # comeca com "custo infinito" para todos
     dist[origem] = 0
-    primeiro_salto = {r: None for r in ROTEADORES}
-    fila = [(0, origem)]
+    primeiro_salto = {r: None for r in roteadores} 
+    fila = [(0, origem)] # fila de prioridade (heap): sempre processa o nó mais barato primeiro
 
     while fila:
         custo_atual, u = heapq.heappop(fila)
-        if custo_atual > dist[u]:
+        if custo_atual > dist[u]: # Se o caminho encontrado for pior, ignora esta entrada
             continue
-        for v, custo_enlace, ip_proximo in grafo[u]:
+        for v, custo_enlace, ip_proximo in grafo.get(u, []):
             novo_custo = custo_atual + custo_enlace
             if novo_custo < dist[v]:
                 dist[v] = novo_custo
                 primeiro_salto[v] = ip_proximo if u == origem else primeiro_salto[u]
                 heapq.heappush(fila, (novo_custo, v))
-
     return dist, primeiro_salto
 
+# Guarda o estado de um roteador: interfaces locais, vizinhos diretos, a LSDB (mapa da rede inteira) e a tabela de rotas calculada.
+class AgenteLinkState:
+    def __init__(self, nome):
+        self.nome = nome
+        self.interfaces = obter_interfaces()
+        self.redes_diretas = {i["rede"] for i in self.interfaces}
+        self.vizinhos = {} # tabela de vizinhança {"nome","iface","rede","ultimo_hello","latencia"}
+        self.lsdb = {} #conhecimento de quem está ligado a quem {"seq","links","atualizado_em"}
+        self.seq_local = 0
+        self.tabela = {} # resultado final do Dijkstra {"custo","next_hop_ip"}
+        self.lock = Lock()
+        self.enviar_lsa_callback = None  # injetado pelo main.py: fn(msg, ip_excecao)
+        print(f"[{self.nome}] Interfaces: {self.interfaces}")
 
-def redes_conectadas(roteador):
-    conectadas = set()
-    for ra, rb, _, rede, _, _ in ENLACES:
-        if ra == roteador or rb == roteador:
-            conectadas.add(rede)
-    return conectadas
+    # Chamado toda vez que chega uma mensagem HELLO de outro roteador.
+    def registrar_hello(self, nome_vizinho, ip_origem):
+        iface_local, rede_local = self._iface_para_ip(ip_origem)
+        if iface_local is None:
+            return
+        novo = ip_origem not in self.vizinhos
+        with self.lock:
+            self.vizinhos[ip_origem] = {
+                "nome": nome_vizinho, "iface": iface_local, "rede": rede_local,
+                "ultimo_hello": time.time(), # carimbo de tempo, usado por expirar_vizinhos()
+                "latencia": self.vizinhos.get(ip_origem, {}).get("latencia"),
+            }
+        if novo:
+            print(f"[{self.nome}] Novo vizinho: {nome_vizinho} ({ip_origem})")
 
+    def expirar_vizinhos(self):
+        agora = time.time()
+        mudou = False
+        with self.lock:
+            for ip in list(self.vizinhos.keys()):
+                if agora - self.vizinhos[ip]["ultimo_hello"] > TIMEOUT_VIZINHO:
+                    print(f"[{self.nome}] Vizinho {self.vizinhos[ip]['nome']} caiu")
+                    del self.vizinhos[ip]
+                    mudou = True
+        if mudou:
+            self.originar_lsa()
 
-def calcular_rotas():
-    grafo = construir_grafo()
-    rotas_por_roteador = {}
+    def _iface_para_ip(self, ip):
+        for i in self.interfaces:
+            if ipaddress.ip_address(ip) in ipaddress.ip_network(i["rede"]):
+                return i["iface"], i["rede"]
+        return None, None
 
-    for origem in ROTEADORES:
-        dist, primeiro_salto = dijkstra(grafo, origem)
-        conectadas = redes_conectadas(origem)
-        rotas = {}
+    def _ip_local_da_rede(self, rede):
+        for i in self.interfaces:
+            if i["rede"] == rede:
+                return i["ip"]
+        return None
 
-        for ra, rb, _, rede, _, _ in ENLACES:
-            if rede in conectadas:
-                continue
-            custo_via_ra = dist[ra]
-            custo_via_rb = dist[rb]
+    def atualizar_latencia(self, ip, latencia):
+        mudou_muito = False
+        with self.lock:
+            if ip in self.vizinhos:
+                antiga = self.vizinhos[ip]["latencia"]
+                self.vizinhos[ip]["latencia"] = latencia
+                if latencia is not None and (antiga is None or abs(latencia - antiga) > 2):
+                    mudou_muito = True
+        if mudou_muito:
+            self.originar_lsa()
 
-            if custo_via_ra <= custo_via_rb:
-                proximo_hop = primeiro_salto[ra]
-            else:
-                proximo_hop = primeiro_salto[rb]
+    # ----- LSA: minha propria divulgacao -----
 
-            melhor_custo = min(custo_via_ra, custo_via_rb)
+    def originar_lsa(self):
+        with self.lock:
+            self.seq_local += 1
+            links = []
+            for ip, v in self.vizinhos.items():
+                if v["latencia"] is None:
+                    continue
+                links.append({
+                    "vizinho": v["nome"], "rede": v["rede"],
+                    "ip_local": self._ip_local_da_rede(v["rede"]),
+                    "ip_vizinho": ip, "latencia": v["latencia"],
+                })
+            self.lsdb[self.nome] = {"seq": self.seq_local, "links": links,"atualizado_em": time.time()}
+        msg = {"origem": self.nome, "seq": self.seq_local, "links": links}
+        if self.enviar_lsa_callback:
+            self.enviar_lsa_callback(msg, None)
+        self.recalcular_rotas()
 
-            if rede not in rotas or melhor_custo < rotas[rede][0]:
-                rotas[rede] = (melhor_custo, proximo_hop)
+    # ----- LSA recebida de outro roteador -----
 
-        rotas_por_roteador[origem] = [(rede, nh) for rede, (_, nh) in sorted(rotas.items())]
+    def processar_lsa_recebida(self, msg, ip_de_quem_enviou):
+        origem = msg["origem"]
+        if origem == self.nome:
+            return
+        with self.lock:
+            atual = self.lsdb.get(origem)
+            eh_novidade = atual is None or msg["seq"] > atual["seq"]
+            if eh_novidade:
+                self.lsdb[origem] = {"seq": msg["seq"], "links": msg["links"],
+                                      "atualizado_em": time.time()}
+        if eh_novidade:
+            if self.enviar_lsa_callback:
+                self.enviar_lsa_callback(msg, ip_de_quem_enviou)  # propaga adiante
+            self.recalcular_rotas()
 
-    return rotas_por_roteador
+    def expirar_lsdb(self):
+        agora = time.time()
+        mudou = False
+        with self.lock:
+            for origem in list(self.lsdb.keys()):
+                if origem == self.nome:
+                    continue
+                if agora - self.lsdb[origem]["atualizado_em"] > TIMEOUT_LSA:
+                    print(f"[{self.nome}] LSA de {origem} expirou")
+                    del self.lsdb[origem]
+                    mudou = True
+        if mudou:
+            self.recalcular_rotas()
 
+    # ----- Dijkstra local + aplicacao no kernel -----
 
-DAEMONS_TEMPLATE = """\
-# This file tells the frr package which daemons to start.
-#
-# Sample configurations for these daemons can be found in
-# /usr/share/doc/frr/examples/.
-#
-# ATTENTION:
-#
-# When activating a daemon for the first time, a config file, even if it is
-# empty, has to be present *and* be owned by the user and group "frr", else
-# the daemon will not be started by /etc/init.d/frr. The permissions should
-# be u=rw,g=r,o=.
-# When using "vtysh" such a config file is also needed. It should be owned by
-# group "frrvty" and set to ug=rw,o= though. Check /etc/pam.d/frr, too.
-#
-# The watchfrr, zebra and staticd daemons are always started.
-#
-bgpd=no
-ospfd=no
-ospf6d=no
-ripd=no
-ripngd=no
-isisd=no
-pimd=no
-pim6d=no
-ldpd=no
-nhrpd=no
-eigrpd=no
-babeld=no
-sharpd=no
-pbrd=no
-bfdd=no
-fabricd=no
-vrrpd=no
-pathd=no
+    def recalcular_rotas(self):
+        with self.lock:
+            lsdb_copia = dict(self.lsdb)
 
-#
-# If this option is set the /etc/init.d/frr script automatically loads
-# the config via "vtysh -b" when the servers are started.
-# Check /etc/pam.d/frr if you intend to use "vtysh"!
-#
-vtysh_enable=yes
-zebra_options="  -A 127.0.0.1 -s 90000000"
-bgpd_options="   -A 127.0.0.1"
-ospfd_options="  -A 127.0.0.1"
-ospf6d_options=" -A ::1"
-ripd_options="   -A 127.0.0.1"
-ripngd_options=" -A ::1"
-isisd_options="  -A 127.0.0.1"
-pimd_options="   -A 127.0.0.1"
-pim6d_options="  -A ::1"
-ldpd_options="   -A 127.0.0.1"
-nhrpd_options="  -A 127.0.0.1"
-eigrpd_options=" -A 127.0.0.1"
-babeld_options=" -A 127.0.0.1"
-sharpd_options=" -A 127.0.0.1"
-pbrd_options="   -A 127.0.0.1"
-staticd_options="-A 127.0.0.1"
-bfdd_options="   -A 127.0.0.1"
-fabricd_options="-A 127.0.0.1"
-vrrpd_options="  -A 127.0.0.1"
-pathd_options="  -A 127.0.0.1"
-"""
+        roteadores = {self.nome} | set(lsdb_copia.keys())
+        for info in lsdb_copia.values():
+            for link in info["links"]:
+                roteadores.add(link["vizinho"])
 
+        grafo = {r: [] for r in roteadores}
+        for origem, info in lsdb_copia.items():
+            for link in info["links"]:
+                custo = PESO_SALTO + link["latencia"]
+                grafo[origem].append((link["vizinho"], custo, link["ip_vizinho"]))
 
-def gerar_configs(rotas_por_roteador, diretorio_saida):
-    for roteador, rotas in rotas_por_roteador.items():
-        pasta = os.path.join(diretorio_saida, roteador)
-        os.makedirs(pasta, exist_ok=True)
+        dist, primeiro_salto = dijkstra(grafo, self.nome, roteadores)
 
-        with open(os.path.join(pasta, 'daemons'), 'w') as f:
-            f.write(DAEMONS_TEMPLATE)
+        nova_tabela = {}
+        for origem, info in lsdb_copia.items():
+            for link in info["links"]:
+                rede = link["rede"]
+                if rede in self.redes_diretas:
+                    continue
+                custo_origem = dist.get(origem, float('inf'))
+                if custo_origem == float('inf') or primeiro_salto[origem] is None:
+                    continue
+                if rede not in nova_tabela or custo_origem < nova_tabela[rede]["custo"]:
+                    nova_tabela[rede] = {"custo": custo_origem,
+                                          "next_hop_ip": primeiro_salto[origem]}
 
-        linhas = [
-            "frr version 8.4.4",
-            "frr defaults traditional",
-            f"hostname {roteador}",
-            "domainname localdomain",
-            "log syslog informational",
-            "no ipv6 forwarding",
-            "service integrated-vtysh-config",
-            "!",
-        ]
-        for rede, proximo_hop in rotas:
-            linhas.append(f"ip route {rede} {proximo_hop}")
-        linhas += ["!", "end", ""]
+        with self.lock:
+            self.tabela = nova_tabela
+        self._aplicar_rotas()
+        self._imprimir_tabela()
 
-        with open(os.path.join(pasta, 'frr.conf'), 'w') as f:
-            f.write("\n".join(linhas))
+    def _aplicar_rotas(self):
+        with self.lock:
+            itens = list(self.tabela.items())
+        for rede, info in itens:
+            subprocess.run(["ip", "route", "replace", rede, "via", info["next_hop_ip"]],
+                            capture_output=True)
 
-
-def imprimir_resumo(rotas_por_roteador):
-    print("=== Algoritmo Proprio: Metrica Hibrida ===")
-    print("Custo por enlace = 10 + latencia_ms")
-    print()
-
-    print("Latencias configuradas:")
-    for ra, rb, lat, rede, _, _ in ENLACES:
-        custo = 10 + lat
-        print(f"  {ra}-{rb} ({rede}): lat={lat}ms -> custo={custo}")
-    print()
-
-    print("Tabela de rotas estaticas geradas:")
-    for roteador in ROTEADORES:
-        print(f"\n  {roteador}:")
-        for rede, nh in rotas_por_roteador[roteador]:
-            print(f"    {rede} via {nh}")
-
-
-if __name__ == '__main__':
-    rotas = calcular_rotas()
-    imprimir_resumo(rotas)
-
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    gerar_configs(rotas, base_dir)
-
-    print("\nArquivos gerados em configs/algoritmo_proprio/R*/")
+    def _imprimir_tabela(self):
+        with self.lock:
+            print(f"\n=== {self.nome} | roteadores conhecidos: "
+                  f"{list(self.lsdb.keys()) + [self.nome]} | {time.strftime('%H:%M:%S')} ===")
+            for rede, info in sorted(self.tabela.items()):
+                print(f"  {rede:<20} custo={info['custo']:<6.1f} via={info['next_hop_ip']}")
