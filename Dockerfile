@@ -2,6 +2,7 @@ FROM debian:bookworm
 
 RUN apt-get update && \
     apt-get install -y \
+    python3 \
     frr \
     iproute2 \
     iputils-ping \

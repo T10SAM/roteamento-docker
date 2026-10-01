@@ -13,7 +13,7 @@ services:
       r1-r2:
         ipv4_address: 192.168.5.2
       r5-r1:
-        ipv4_address: 192.168.9.2
+        ipv4_address: 192.168.9.3
       r1-r3:
         ipv4_address: 192.100.1.2
 
@@ -79,7 +79,7 @@ services:
       r4-r5:
         ipv4_address: 192.168.8.3
       r5-r1:
-        ipv4_address: 192.168.9.3
+        ipv4_address: 192.168.9.2
       r5-r2:
         ipv4_address: 192.100.2.2
 
