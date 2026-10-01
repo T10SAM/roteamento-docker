@@ -95,6 +95,7 @@ class AgenteLinkState:
         if novo:
             print(f"[{self.nome}] Novo vizinho: {nome_vizinho} ({ip_origem})")
 
+    # Remove da lista de vizinhos quem nao manda HELLO
     def expirar_vizinhos(self):
         agora = time.time()
         mudou = False
@@ -107,6 +108,7 @@ class AgenteLinkState:
         if mudou:
             self.originar_lsa()
 
+    # Descobre em qual das interfaces um IP vizinho se encaixa
     def _iface_para_ip(self, ip):
         for i in self.interfaces:
             if ipaddress.ip_address(ip) in ipaddress.ip_network(i["rede"]):
