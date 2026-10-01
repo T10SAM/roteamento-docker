@@ -35,7 +35,7 @@ aplicar.bat rip
 aplicar.bat ospf
 ```
 ```cmd
-aplicar.bat algoritmo_proprio
+aplicar.bat proprio
 ```
 Mac / Linux:
 ```bash

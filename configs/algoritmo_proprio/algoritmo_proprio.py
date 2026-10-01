@@ -132,8 +132,8 @@ class AgenteLinkState:
         if mudou_muito:
             self.originar_lsa()
 
-    # ----- LSA: minha propria divulgacao -----
-
+    # Monta e divulga a LSA, enviando uma mensagem contendo os links diretos e a latencia de cada um
+    # Cada roteador que receber essa LSA monta seu proprio mapa
     def originar_lsa(self):
         with self.lock:
             self.seq_local += 1
@@ -150,10 +150,11 @@ class AgenteLinkState:
         msg = {"origem": self.nome, "seq": self.seq_local, "links": links}
         if self.enviar_lsa_callback:
             self.enviar_lsa_callback(msg, None)
-        self.recalcular_rotas()
+        self.recalcular_rotas() # Caso a latência mude ou perca um vizinho, então deve recalcular as rotas
 
-    # ----- LSA recebida de outro roteador -----
-
+    # Chamado pelo main.py sempre que chega uma LSA de outro roteador
+    # Se a LSA é mais nova do que a que tinha (seq maior), atualiza o mapa e repassa essa LSA para os outros vizinhos
+    # Se for mais velha, então é ignorada
     def processar_lsa_recebida(self, msg, ip_de_quem_enviou):
         origem = msg["origem"]
         if origem == self.nome:
@@ -169,13 +170,14 @@ class AgenteLinkState:
                 self.enviar_lsa_callback(msg, ip_de_quem_enviou)  # propaga adiante
             self.recalcular_rotas()
 
+    # Roda periodicamente removendo do mapa qualquer roteador cuja LSA nao foi renovada há mais de TIMEOUT_LSA segundos.
     def expirar_lsdb(self):
         agora = time.time()
         mudou = False
         with self.lock:
             for origem in list(self.lsdb.keys()):
                 if origem == self.nome:
-                    continue
+                    continue # nunca expira a propria entrada
                 if agora - self.lsdb[origem]["atualizado_em"] > TIMEOUT_LSA:
                     print(f"[{self.nome}] LSA de {origem} expirou")
                     del self.lsdb[origem]
@@ -183,17 +185,18 @@ class AgenteLinkState:
         if mudou:
             self.recalcular_rotas()
 
-    # ----- Dijkstra local + aplicacao no kernel -----
-
+    # A partir de tudo que se sabe sobre a rede, remonta o grafo completo e roda Dijkstra
     def recalcular_rotas(self):
         with self.lock:
             lsdb_copia = dict(self.lsdb)
 
+        # Monta a lista de todos os roteadores que aparecem em algum lugar do mapa
         roteadores = {self.nome} | set(lsdb_copia.keys())
         for info in lsdb_copia.values():
             for link in info["links"]:
                 roteadores.add(link["vizinho"])
 
+        # Monta o grafo no formato que a funcao dijkstra() espera: (vizinho, custo_do_link, ip_do_proximo_salto)
         grafo = {r: [] for r in roteadores}
         for origem, info in lsdb_copia.items():
             for link in info["links"]:
@@ -202,15 +205,17 @@ class AgenteLinkState:
 
         dist, primeiro_salto = dijkstra(grafo, self.nome, roteadores)
 
+         # A partir das distancias calculadas, é decidido a rota para cada REDE
         nova_tabela = {}
         for origem, info in lsdb_copia.items():
             for link in info["links"]:
                 rede = link["rede"]
                 if rede in self.redes_diretas:
-                    continue
+                    continue # Se for rede propria, diretamente conectada, então não precisa de rota
                 custo_origem = dist.get(origem, float('inf'))
                 if custo_origem == float('inf') or primeiro_salto[origem] is None:
                     continue
+                # Se já temos uma rota mais barata para essa rede, mantemos a mais barata
                 if rede not in nova_tabela or custo_origem < nova_tabela[rede]["custo"]:
                     nova_tabela[rede] = {"custo": custo_origem,
                                           "next_hop_ip": primeiro_salto[origem]}
@@ -220,6 +225,7 @@ class AgenteLinkState:
         self._aplicar_rotas()
         self._imprimir_tabela()
 
+    #Instala cada rota calculada na tabela de roteamento REAL do kernel Linux, usando o comando "ip route replace"
     def _aplicar_rotas(self):
         with self.lock:
             itens = list(self.tabela.items())
